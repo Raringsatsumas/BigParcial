@@ -1,24 +1,18 @@
-from fastapi import FastAPI, Depends
-from sqlalchemy.orm import Session
-from sqlalchemy import text
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .db import get_db
+
+from .routers import health, catalog, purchases
 
 app = FastAPI(title="Chinook Store API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # puedes limitar a tu IP del front si quieres
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-@app.get("/tracks/count")
-def tracks_count(db: Session = Depends(get_db)):
-    result = db.execute(text("SELECT COUNT(*) AS c FROM Track")).mappings().first()
-    return {"tracks": result["c"]}
+app.include_router(health.router, prefix="/v1")
+app.include_router(catalog.router, prefix="/v1")
+app.include_router(purchases.router, prefix="/v1")
