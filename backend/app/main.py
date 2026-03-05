@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .routers import health, catalog, purchases
+from .routers import health, catalog, purchases, auth
 
 app = FastAPI(title="Chinook Store API")
 
