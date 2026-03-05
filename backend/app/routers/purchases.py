@@ -1,76 +1,244 @@
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from pydantic import BaseModel, Field
 from sqlalchemy import text
-from datetime import datetime, timezone
+from sqlalchemy.orm import Session
 
 from ..db import get_db
-from .auth import get_current_user
+from .auth import get_current_user  # debe existir en tu proyecto
+
 
 router = APIRouter(tags=["purchases"])
 
-@router.get("/purchases")
-def my_purchases(db: Session = Depends(get_db), user=Depends(get_current_user)):
+
+# -----------------------------
+# Pydantic models
+# -----------------------------
+class PurchaseCreate(BaseModel):
+    track_id: int = Field(..., gt=0)
+    quantity: int = Field(1, ge=1, le=99)
+
+
+class PurchaseItem(BaseModel):
+    InvoiceId: int
+    InvoiceDate: str
+    TrackId: int
+    TrackName: str
+    AlbumTitle: Optional[str] = None
+    ArtistName: Optional[str] = None
+    GenreName: Optional[str] = None
+    UnitPrice: float
+    Quantity: int
+    LineTotal: float
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _next_id(db: Session, table: str, col: str) -> int:
+    row = db.execute(
+        text(f"SELECT IFNULL(MAX({col}), 0) + 1 AS next_id FROM {table}")
+    ).mappings().first()
+    return int(row["next_id"])
+
+
+def _get_customer_id(user: Dict[str, Any]) -> int:
+    # soporta varios nombres por si tu auth devuelve diferente
+    cid = user.get("chinook_customer_id") or user.get("customer_id")
+    if not cid:
+        raise HTTPException(
+            status_code=400,
+            detail="Usuario autenticado sin chinook_customer_id/customer_id asociado.",
+        )
+    return int(cid)
+
+
+# -----------------------------
+# Endpoints
+# -----------------------------
+@router.get("/purchases", response_model=Dict[str, List[PurchaseItem]])
+def list_purchases(
+    db: Session = Depends(get_db),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Lista compras del usuario (por CustomerId de Chinook).
+    IMPORTANTE: incluye TrackId para que el front pueda bloquear 'comprar' si ya la tiene.
+    """
+    customer_id = _get_customer_id(user)
+
     rows = db.execute(
-        text("""
+        text(
+            """
             SELECT
-              p.id, p.purchased_at, p.quantity, p.total,
-              t.TrackId, t.Name AS TrackName,
+              i.InvoiceId,
+              DATE_FORMAT(i.InvoiceDate, '%Y-%m-%d %H:%i:%s') AS InvoiceDate,
+              t.TrackId,
+              t.Name AS TrackName,
+              al.Title AS AlbumTitle,
               ar.Name AS ArtistName,
-              g.Name AS GenreName
-            FROM app_purchase p
-            JOIN Track t ON t.TrackId = p.track_id
+              g.Name AS GenreName,
+              il.UnitPrice,
+              il.Quantity,
+              (il.UnitPrice * il.Quantity) AS LineTotal
+            FROM Invoice i
+            JOIN InvoiceLine il ON il.InvoiceId = i.InvoiceId
+            JOIN Track t ON t.TrackId = il.TrackId
             JOIN Album al ON al.AlbumId = t.AlbumId
             JOIN Artist ar ON ar.ArtistId = al.ArtistId
             LEFT JOIN Genre g ON g.GenreId = t.GenreId
-            WHERE p.user_id = :uid
-            ORDER BY p.purchased_at DESC
-        """),
-        {"uid": user["id"]},
+            WHERE i.CustomerId = :cid
+            ORDER BY i.InvoiceDate DESC, i.InvoiceId DESC
+            LIMIT 300
+            """
+        ),
+        {"cid": customer_id},
     ).mappings().all()
-    return {"items": list(rows)}
+
+    # asegurar floats (a veces viene Decimal)
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "InvoiceId": int(r["InvoiceId"]),
+                "InvoiceDate": r["InvoiceDate"],
+                "TrackId": int(r["TrackId"]),
+                "TrackName": r["TrackName"],
+                "AlbumTitle": r.get("AlbumTitle"),
+                "ArtistName": r.get("ArtistName"),
+                "GenreName": r.get("GenreName"),
+                "UnitPrice": float(r["UnitPrice"]),
+                "Quantity": int(r["Quantity"]),
+                "LineTotal": float(r["LineTotal"]),
+            }
+        )
+
+    return {"items": out}
+
 
 @router.post("/purchases")
-def buy(payload: dict, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    track_id = int(payload.get("track_id", 0))
-    quantity = int(payload.get("quantity", 1))
-    if track_id <= 0 or quantity <= 0:
-        raise HTTPException(400, "track_id and quantity required")
+def create_purchase(
+    payload: PurchaseCreate,
+    db: Session = Depends(get_db),
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Crea una compra:
+    - valida track
+    - NO permite comprar/descargar el mismo track más de una vez (409)
+    - inserta Invoice + InvoiceLine (usando MAX()+1 para evitar problemas de PK)
+    """
+    customer_id = _get_customer_id(user)
+    track_id = payload.track_id
+    quantity = payload.quantity
 
+    # 1) validar track y obtener precio
     track = db.execute(
-        text("SELECT TrackId, UnitPrice FROM Track WHERE TrackId=:tid"),
+        text("SELECT TrackId, UnitPrice FROM Track WHERE TrackId = :tid"),
         {"tid": track_id},
     ).mappings().first()
     if not track:
-        raise HTTPException(404, "Track not found")
+        raise HTTPException(404, "Track no existe")
 
     unit_price = float(track["UnitPrice"])
-    total = unit_price * quantity
-    invoice_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    line_total = float(unit_price * quantity)
 
-    invoice_id = None
+    # 2) bloquear recompra (no descarga más de una vez)
+    already = db.execute(
+        text(
+            """
+            SELECT 1
+            FROM InvoiceLine il
+            JOIN Invoice i ON i.InvoiceId = il.InvoiceId
+            WHERE i.CustomerId = :cid AND il.TrackId = :tid
+            LIMIT 1
+            """
+        ),
+        {"cid": customer_id, "tid": track_id},
+    ).first()
+    if already:
+        raise HTTPException(
+            status_code=409,
+            detail="Ya compraste esta canción. No puedes comprar/descargarla otra vez.",
+        )
+
+    # 3) obtener info de facturación (opcional, pero queda bonito)
+    cust = db.execute(
+        text(
+            """
+            SELECT Address, City, State, Country, PostalCode
+            FROM Customer
+            WHERE CustomerId = :cid
+            """
+        ),
+        {"cid": customer_id},
+    ).mappings().first()
+    if not cust:
+        raise HTTPException(404, "CustomerId no existe en Chinook")
+
+    invoice_id = _next_id(db, "Invoice", "InvoiceId")
+    invoice_line_id = _next_id(db, "InvoiceLine", "InvoiceLineId")
+
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
     try:
+        # 4) insertar Invoice
         db.execute(
-            text("INSERT INTO Invoice (CustomerId, InvoiceDate, Total) VALUES (:cid,:dt,:tot)"),
-            {"cid": user["chinook_customer_id"] or 1, "dt": invoice_date, "tot": total},
+            text(
+                """
+                INSERT INTO Invoice
+                  (InvoiceId, CustomerId, InvoiceDate, BillingAddress, BillingCity, BillingState,
+                   BillingCountry, BillingPostalCode, Total)
+                VALUES
+                  (:iid, :cid, :dt, :addr, :city, :st, :cty, :pc, :tot)
+                """
+            ),
+            {
+                "iid": invoice_id,
+                "cid": customer_id,
+                "dt": now,
+                "addr": cust.get("Address"),
+                "city": cust.get("City"),
+                "st": cust.get("State"),
+                "cty": cust.get("Country"),
+                "pc": cust.get("PostalCode"),
+                "tot": line_total,
+            },
         )
-        invoice_id = db.execute(text("SELECT LAST_INSERT_ID() AS id")).mappings().first()["id"]
 
+        # 5) insertar InvoiceLine
         db.execute(
-            text("""
-              INSERT INTO InvoiceLine (InvoiceId, TrackId, UnitPrice, Quantity)
-              VALUES (:iid,:tid,:up,:q)
-            """),
-            {"iid": invoice_id, "tid": track_id, "up": unit_price, "q": quantity},
+            text(
+                """
+                INSERT INTO InvoiceLine
+                  (InvoiceLineId, InvoiceId, TrackId, UnitPrice, Quantity)
+                VALUES
+                  (:ilid, :iid, :tid, :up, :qty)
+                """
+            ),
+            {
+                "ilid": invoice_line_id,
+                "iid": invoice_id,
+                "tid": track_id,
+                "up": unit_price,
+                "qty": quantity,
+            },
         )
-    except Exception:
-        invoice_id = None
 
-    db.execute(
-        text("""
-          INSERT INTO app_purchase (user_id, invoice_id, track_id, unit_price, quantity, total)
-          VALUES (:uid,:iid,:tid,:up,:q,:tot)
-        """),
-        {"uid": user["id"], "iid": invoice_id, "tid": track_id, "up": unit_price, "q": quantity, "tot": total},
-    )
-    db.commit()
-    return {"ok": True, "invoice_id": invoice_id, "total": total}
+        db.commit()
+
+        return {
+            "ok": True,
+            "invoice_id": invoice_id,
+            "invoice_line_id": invoice_line_id,
+            "track_id": track_id,
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "total": line_total,
+        }
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Purchase failed: {str(e)}")
