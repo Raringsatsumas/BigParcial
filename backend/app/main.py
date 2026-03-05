@@ -13,6 +13,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(health.router)
 app.include_router(health.router, prefix="/v1")
 app.include_router(catalog.router, prefix="/v1")
 app.include_router(purchases.router, prefix="/v1")
