@@ -17,3 +17,6 @@ app.include_router(health.router)
 app.include_router(health.router, prefix="/v1")
 app.include_router(catalog.router, prefix="/v1")
 app.include_router(purchases.router, prefix="/v1")
+app.include_router(catalog.router, prefix="/v1")      # público
+app.include_router(purchases.router, prefix="/v1")    # requiere token
+app.include_router(admin_tracks.router, prefix="/v1") # requiere admin

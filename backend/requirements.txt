@@ -5,3 +5,6 @@ sqlalchemy
 pymysql
 pytest
 httpx
+cryptography
+python-jose[cryptograpy]
+python-multipart
