@@ -90,15 +90,25 @@ def update_track(track_id: int, payload: dict, db: Session = Depends(get_db), _=
     return {"ok": True}
 
 
+from sqlalchemy import text
+from fastapi import HTTPException
+
 @router.delete("/admin/tracks/{track_id}")
-def delete_track(track_id: int, db: Session = Depends(get_db), _=Depends(require_admin)):
+def delete_track(track_id: int, db: Session = Depends(get_db), user=Depends(require_admin)):
     try:
-        res = db.execute(text("DELETE FROM Track WHERE TrackId=:tid"), {"tid": track_id})
+        # primero dependencias
+        db.execute(text("DELETE FROM InvoiceLine WHERE TrackId = :tid"), {"tid": track_id})
+        db.execute(text("DELETE FROM PlaylistTrack WHERE TrackId = :tid"), {"tid": track_id})
+
+        # luego el track
+        res = db.execute(text("DELETE FROM Track WHERE TrackId = :tid"), {"tid": track_id})
         db.commit()
+
         if res.rowcount == 0:
-            raise HTTPException(404, "Track not found")
-        return {"ok": True}
-    except Exception:
+            raise HTTPException(404, "Track no existe")
+
+        return {"ok": True, "deleted": track_id}
+
+    except Exception as e:
         db.rollback()
-        # si tiene referencias (InvoiceLine, PlaylistTrack, etc.)
-        raise HTTPException(409, "Cannot delete track (has references).")
+        raise HTTPException(500, f"Delete failed: {str(e)}")
