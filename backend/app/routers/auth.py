@@ -60,10 +60,6 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
     token = create_access_token(subject=user["username"], role=user["role"])
     return {"access_token": token, "token_type": "bearer", "role": user["role"], "username": user["username"]}
 
-@router.get("/auth/me")
-def me(user=Depends(get_current_user)):
-    return user
-
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     payload = decode_token(token)
     username = payload.get("sub")
