@@ -8,7 +8,7 @@ def test_token_roundtrip():
         "chinook_customer_id": 99,
     }
 
-    token = create_access_token(payload_in, "user")
+    token = create_access_token(payload_in["sub"], payload_in["role"])
     payload_out = decode_token(token)
 
     assert payload_out["sub"] == "juan"
