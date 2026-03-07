@@ -10,6 +10,7 @@ jobs:
     defaults:
       run:
         working-directory: backend
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,6 +34,7 @@ jobs:
     defaults:
       run:
         working-directory: frontend
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,8 +43,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
-          cache-dependency-path: frontend/package-lock.json
 
       - name: Install frontend dependencies
         run: npm ci
@@ -53,21 +53,31 @@ jobs:
   deploy:
     needs: [backend-tests, frontend-tests]
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup SSH key
+        shell: bash
         run: |
+          set -euxo pipefail
+
           mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          printf '%s\n' "${{ secrets.EC2_SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.EC2_BACK_HOST }} >> ~/.ssh/known_hosts
-          ssh-keyscan -H ${{ secrets.EC2_FRONT_HOST }} >> ~/.ssh/known_hosts
+
+          # valida que la llave esté bien formada
+          ssh-keygen -y -f ~/.ssh/id_rsa > /dev/null
+
+          # agrega hosts conocidos
+          ssh-keyscan -H "${{ secrets.EC2_BACK_HOST }}" >> ~/.ssh/known_hosts
+          ssh-keyscan -H "${{ secrets.EC2_FRONT_HOST }}" >> ~/.ssh/known_hosts
 
       - name: Deploy backend
+        shell: bash
         run: |
-          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_BACK_HOST }} << 'EOF'
+          ssh -o StrictHostKeyChecking=yes -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_BACK_HOST }} << 'EOF'
             cd ~/BigParcial
             git pull --ff-only
             cd backend
@@ -79,8 +89,9 @@ jobs:
           EOF
 
       - name: Deploy frontend
+        shell: bash
         run: |
-          ssh -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_FRONT_HOST }} << 'EOF'
+          ssh -o StrictHostKeyChecking=yes -i ~/.ssh/id_rsa ubuntu@${{ secrets.EC2_FRONT_HOST }} << 'EOF'
             cd ~/BigParcial
             git pull --ff-only
             cd frontend
