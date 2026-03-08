@@ -1,3 +1,34 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from ..db import get_db
+from .auth import get_current_user
+
+router = APIRouter(prefix="/admin/tracks", tags=["admin-tracks"])
+
+
+def require_admin(user=Depends(get_current_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Solo admin")
+    return user
+
+
+def _parse_non_negative_price(raw_price):
+    if raw_price is None or str(raw_price).strip() == "":
+        raise HTTPException(status_code=400, detail="Precio requerido")
+
+    try:
+        price = float(raw_price)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Precio inválido")
+
+    if price < 0:
+        raise HTTPException(status_code=400, detail="El precio no puede ser negativo")
+
+    return price
+
+
 @router.post("")
 def create_track(
     payload: dict,
@@ -6,7 +37,11 @@ def create_track(
 ):
     try:
         name = (payload.get("name") or "").strip()
-        raw_unit_price = payload.get("unit_price")
+        if not name:
+            raise HTTPException(status_code=400, detail="Nombre requerido")
+
+        unit_price = _parse_non_negative_price(payload.get("unit_price"))
+
         raw_genre_id = payload.get("genre_id")
         raw_media_type_id = payload.get("media_type_id")
         composer = payload.get("composer")
@@ -14,7 +49,7 @@ def create_track(
         bytes_value = payload.get("bytes")
 
         album_id = payload.get("album_id")
-        album_mode = payload.get("album_mode") or payload.get("album_source")
+        album_mode = payload.get("album_mode") or payload.get("album_source") or "existing"
         artist_id = payload.get("artist_id")
         new_album_title = (
             payload.get("new_album_title")
@@ -23,21 +58,7 @@ def create_track(
             or ""
         ).strip()
 
-        if not name:
-            raise HTTPException(status_code=400, detail="Nombre requerido")
-
-        if raw_unit_price is None or str(raw_unit_price).strip() == "":
-            raise HTTPException(status_code=400, detail="Precio requerido")
-
-        try:
-            unit_price = float(raw_unit_price)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Precio inválido")
-
-        if unit_price < 0:
-            raise HTTPException(status_code=400, detail="El precio no puede ser negativo")
-
-        # Si no viene album_id, crear álbum nuevo cuando corresponda
+        # Si no llega album_id y quieren crear nuevo álbum
         if not album_id:
             if album_mode == "new" or new_album_title:
                 if not artist_id:
@@ -65,7 +86,7 @@ def create_track(
             else:
                 raise HTTPException(status_code=400, detail="Álbum requerido")
 
-        # Validar que el álbum exista
+        # Validar álbum
         album_exists = db.execute(
             text("SELECT AlbumId FROM Album WHERE AlbumId = :album_id"),
             {"album_id": int(album_id)},
@@ -73,7 +94,7 @@ def create_track(
         if not album_exists:
             raise HTTPException(status_code=400, detail="Álbum inválido")
 
-        # Resolver MediaTypeId válido
+        # MediaType válido
         if raw_media_type_id not in (None, "", 0, "0"):
             media_type_id = int(raw_media_type_id)
             media_exists = db.execute(
@@ -90,7 +111,7 @@ def create_track(
                 raise HTTPException(status_code=400, detail="No hay MediaType disponible")
             media_type_id = int(media_row["MediaTypeId"])
 
-        # Resolver GenreId válido o null
+        # Genre válido o null
         genre_id = None
         if raw_genre_id not in (None, "", 0, "0"):
             genre_id = int(raw_genre_id)
@@ -134,3 +155,123 @@ def create_track(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Error creando track: {str(e)}")
+
+
+@router.put("/{track_id}")
+def update_track(
+    track_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    try:
+        exists = db.execute(
+            text("SELECT TrackId FROM Track WHERE TrackId = :track_id"),
+            {"track_id": track_id},
+        ).mappings().first()
+
+        if not exists:
+            raise HTTPException(status_code=404, detail="Track no encontrado")
+
+        fields = []
+        params = {"track_id": track_id}
+
+        if "name" in payload:
+            name = (payload.get("name") or "").strip()
+            if not name:
+                raise HTTPException(status_code=400, detail="Nombre requerido")
+            fields.append("Name = :name")
+            params["name"] = name
+
+        if "unit_price" in payload:
+            parsed_price = _parse_non_negative_price(payload.get("unit_price"))
+            fields.append("UnitPrice = :unit_price")
+            params["unit_price"] = parsed_price
+
+        if "genre_id" in payload:
+            genre_raw = payload.get("genre_id")
+            if genre_raw in (None, "", 0, "0"):
+                fields.append("GenreId = :genre_id")
+                params["genre_id"] = None
+            else:
+                genre_id = int(genre_raw)
+                genre_exists = db.execute(
+                    text("SELECT GenreId FROM Genre WHERE GenreId = :genre_id"),
+                    {"genre_id": genre_id},
+                ).mappings().first()
+                if not genre_exists:
+                    raise HTTPException(status_code=400, detail="Género inválido")
+                fields.append("GenreId = :genre_id")
+                params["genre_id"] = genre_id
+
+        if "album_id" in payload:
+            album_id = int(payload.get("album_id"))
+            album_exists = db.execute(
+                text("SELECT AlbumId FROM Album WHERE AlbumId = :album_id"),
+                {"album_id": album_id},
+            ).mappings().first()
+            if not album_exists:
+                raise HTTPException(status_code=400, detail="Álbum inválido")
+            fields.append("AlbumId = :album_id")
+            params["album_id"] = album_id
+
+        if "media_type_id" in payload:
+            media_type_id = int(payload.get("media_type_id"))
+            media_exists = db.execute(
+                text("SELECT MediaTypeId FROM MediaType WHERE MediaTypeId = :media_type_id"),
+                {"media_type_id": media_type_id},
+            ).mappings().first()
+            if not media_exists:
+                raise HTTPException(status_code=400, detail="MediaType inválido")
+            fields.append("MediaTypeId = :media_type_id")
+            params["media_type_id"] = media_type_id
+
+        if not fields:
+            return {"ok": True, "updated": False}
+
+        sql = f"UPDATE Track SET {', '.join(fields)} WHERE TrackId = :track_id"
+        db.execute(text(sql), params)
+        db.commit()
+
+        return {"ok": True, "updated": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error actualizando track: {str(e)}")
+
+
+@router.delete("/{track_id}")
+def delete_track(
+    track_id: int,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    try:
+        db.execute(
+            text("DELETE FROM InvoiceLine WHERE TrackId = :track_id"),
+            {"track_id": track_id},
+        )
+        db.execute(
+            text("DELETE FROM PlaylistTrack WHERE TrackId = :track_id"),
+            {"track_id": track_id},
+        )
+
+        result = db.execute(
+            text("DELETE FROM Track WHERE TrackId = :track_id"),
+            {"track_id": track_id},
+        )
+
+        if result.rowcount == 0:
+            db.rollback()
+            raise HTTPException(status_code=404, detail="Track no encontrado")
+
+        db.commit()
+        return {"ok": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error eliminando track: {str(e)}")
