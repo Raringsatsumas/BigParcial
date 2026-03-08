@@ -45,6 +45,14 @@ def create_track(
         if unit_price is None or str(unit_price).strip() == "":
             raise HTTPException(status_code=400, detail="Precio requerido")
 
+        try:
+            unit_price = float(unit_price)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Precio inválido")
+
+        if unit_price < 0:
+            raise HTTPException(status_code=400, detail="El precio no puede ser negativo")
+
         # Si no viene album_id, intentamos crear uno nuevo si mandan artista + título
         if not album_id:
             if album_mode == "new" or new_album_title:
@@ -94,7 +102,7 @@ def create_track(
                 "composer": composer,
                 "milliseconds": milliseconds,
                 "bytes_value": bytes_value,
-                "unit_price": float(unit_price),
+                "unit_price": unit_price,
             },
         )
 
@@ -132,8 +140,21 @@ def update_track(
             params["name"] = (payload.get("name") or "").strip()
 
         if "unit_price" in payload:
+            raw_price = payload.get("unit_price")
+
+            if raw_price is None or str(raw_price).strip() == "":
+                raise HTTPException(status_code=400, detail="Precio requerido")
+
+            try:
+                parsed_price = float(raw_price)
+            except Exception:
+                raise HTTPException(status_code=400, detail="Precio inválido")
+
+            if parsed_price < 0:
+                raise HTTPException(status_code=400, detail="El precio no puede ser negativo")
+
             fields.append("UnitPrice = :unit_price")
-            params["unit_price"] = float(payload.get("unit_price"))
+            params["unit_price"] = parsed_price
 
         if "genre_id" in payload:
             fields.append("GenreId = :genre_id")
@@ -171,7 +192,6 @@ def delete_track(
     _: dict = Depends(require_admin),
 ):
     try:
-        # Borra referencias para no romper FK
         db.execute(
             text("DELETE FROM InvoiceLine WHERE TrackId = :track_id"),
             {"track_id": track_id},
