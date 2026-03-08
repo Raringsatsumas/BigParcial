@@ -1,114 +1,200 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from ..db import get_db
-from .auth import require_admin
+from .auth import get_current_user
 
-router = APIRouter(tags=["admin"])
-
-def get_or_create_album_for_artist(db: Session, artist_id: int) -> int:
-    # usa el primer album del artista; si no tiene, crea uno
-    row = db.execute(
-        text("SELECT AlbumId FROM Album WHERE ArtistId=:aid ORDER BY AlbumId LIMIT 1"),
-        {"aid": artist_id},
-    ).mappings().first()
-
-    if row:
-        return int(row["AlbumId"])
-
-    db.execute(
-        text("INSERT INTO Album (Title, ArtistId) VALUES (:t, :aid)"),
-        {"t": "Admin Album", "aid": artist_id},
-    )
-    album_id = db.execute(text("SELECT LAST_INSERT_ID() AS id")).mappings().first()["id"]
-    return int(album_id)
+router = APIRouter(prefix="/admin/tracks", tags=["admin-tracks"])
 
 
-@router.post("/admin/tracks")
-def create_track(payload: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
-    """
-    Crea un track con name, unit_price, artist_id, genre_id.
-    Internamente decide AlbumId según el artista.
-    """
-    name = (payload.get("name") or "").strip()
-    unit_price = payload.get("unit_price")
-    artist_id = int(payload.get("artist_id", 0))
-    genre_id = int(payload.get("genre_id", 0))
-
-    if not name or unit_price is None or artist_id <= 0:
-        raise HTTPException(400, "name, unit_price, artist_id required")
-
-    # valida artista
-    a = db.execute(text("SELECT 1 FROM Artist WHERE ArtistId=:aid"), {"aid": artist_id}).first()
-    if not a:
-        raise HTTPException(404, "Artist not found")
-
-    # valida género si viene
-    if genre_id:
-        g = db.execute(text("SELECT 1 FROM Genre WHERE GenreId=:gid"), {"gid": genre_id}).first()
-        if not g:
-            raise HTTPException(404, "Genre not found")
-
-    album_id = get_or_create_album_for_artist(db, artist_id)
-
-    # defaults para Chinook
-    media_type_id = 1          # normalmente existe
-    milliseconds = 200000      # default
-
-    db.execute(
-        text("""
-          INSERT INTO Track (Name, AlbumId, MediaTypeId, GenreId, Milliseconds, UnitPrice)
-          VALUES (:n,:al,:mt,:g,:ms,:up)
-        """),
-        {"n": name, "al": album_id, "mt": media_type_id, "g": (genre_id if genre_id else None), "ms": milliseconds, "up": unit_price},
-    )
-    track_id = db.execute(text("SELECT LAST_INSERT_ID() AS id")).mappings().first()["id"]
-    db.commit()
-    return {"ok": True, "track_id": track_id}
+def require_admin(user=Depends(get_current_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Solo admin")
+    return user
 
 
-@router.put("/admin/tracks/{track_id}")
-def update_track(track_id: int, payload: dict, db: Session = Depends(get_db), _=Depends(require_admin)):
-    fields = []
-    params = {"tid": track_id}
-
-    if "name" in payload and payload["name"] is not None:
-        fields.append("Name=:n")
-        params["n"] = payload["name"]
-    if "unit_price" in payload and payload["unit_price"] is not None:
-        fields.append("UnitPrice=:up")
-        params["up"] = payload["unit_price"]
-
-    if not fields:
-        raise HTTPException(400, "No fields to update (name/unit_price)")
-
-    res = db.execute(text(f"UPDATE Track SET {', '.join(fields)} WHERE TrackId=:tid"), params)
-    db.commit()
-    if res.rowcount == 0:
-        raise HTTPException(404, "Track not found")
-    return {"ok": True}
-
-
-from sqlalchemy import text
-from fastapi import HTTPException
-
-@router.delete("/admin/tracks/{track_id}")
-def delete_track(track_id: int, db: Session = Depends(get_db), user=Depends(require_admin)):
+@router.post("")
+def create_track(
+    payload: dict,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
     try:
-        # primero dependencias
-        db.execute(text("DELETE FROM InvoiceLine WHERE TrackId = :tid"), {"tid": track_id})
-        db.execute(text("DELETE FROM PlaylistTrack WHERE TrackId = :tid"), {"tid": track_id})
+        name = (payload.get("name") or "").strip()
+        unit_price = payload.get("unit_price")
+        genre_id = payload.get("genre_id")
+        media_type_id = payload.get("media_type_id") or 1
+        composer = payload.get("composer")
+        milliseconds = int(payload.get("milliseconds") or 1)
+        bytes_value = int(payload.get("bytes") or 1)
 
-        # luego el track
-        res = db.execute(text("DELETE FROM Track WHERE TrackId = :tid"), {"tid": track_id})
+        album_id = payload.get("album_id")
+        album_mode = payload.get("album_mode") or payload.get("album_source")
+        artist_id = payload.get("artist_id")
+        new_album_title = (
+            payload.get("new_album_title")
+            or payload.get("album_title")
+            or payload.get("new_album_name")
+            or ""
+        ).strip()
+
+        if not name:
+            raise HTTPException(status_code=400, detail="Nombre requerido")
+
+        if unit_price is None or str(unit_price).strip() == "":
+            raise HTTPException(status_code=400, detail="Precio requerido")
+
+        # Si no viene album_id, intentamos crear uno nuevo si mandan artista + título
+        if not album_id:
+            if album_mode == "new" or new_album_title:
+                if not artist_id:
+                    raise HTTPException(status_code=400, detail="Artista requerido para crear álbum")
+                if not new_album_title:
+                    raise HTTPException(status_code=400, detail="Título de álbum requerido")
+
+                next_album_row = db.execute(
+                    text("SELECT COALESCE(MAX(AlbumId), 0) + 1 AS next_id FROM Album")
+                ).mappings().first()
+                next_album_id = int(next_album_row["next_id"])
+
+                db.execute(
+                    text("""
+                        INSERT INTO Album (AlbumId, Title, ArtistId)
+                        VALUES (:album_id, :title, :artist_id)
+                    """),
+                    {
+                        "album_id": next_album_id,
+                        "title": new_album_title,
+                        "artist_id": int(artist_id),
+                    },
+                )
+                album_id = next_album_id
+            else:
+                raise HTTPException(status_code=400, detail="Álbum requerido")
+
+        next_track_row = db.execute(
+            text("SELECT COALESCE(MAX(TrackId), 0) + 1 AS next_id FROM Track")
+        ).mappings().first()
+        next_track_id = int(next_track_row["next_id"])
+
+        db.execute(
+            text("""
+                INSERT INTO Track
+                    (TrackId, Name, AlbumId, MediaTypeId, GenreId, Composer, Milliseconds, Bytes, UnitPrice)
+                VALUES
+                    (:track_id, :name, :album_id, :media_type_id, :genre_id, :composer, :milliseconds, :bytes_value, :unit_price)
+            """),
+            {
+                "track_id": next_track_id,
+                "name": name,
+                "album_id": int(album_id),
+                "media_type_id": int(media_type_id),
+                "genre_id": int(genre_id) if genre_id not in (None, "", 0, "0") else None,
+                "composer": composer,
+                "milliseconds": milliseconds,
+                "bytes_value": bytes_value,
+                "unit_price": float(unit_price),
+            },
+        )
+
         db.commit()
+        return {"ok": True, "track_id": next_track_id, "album_id": int(album_id)}
 
-        if res.rowcount == 0:
-            raise HTTPException(404, "Track no existe")
-
-        return {"ok": True, "deleted": track_id}
-
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(500, f"Delete failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error creando track: {str(e)}")
+
+
+@router.put("/{track_id}")
+def update_track(
+    track_id: int,
+    payload: dict,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    try:
+        exists = db.execute(
+            text("SELECT TrackId FROM Track WHERE TrackId = :track_id"),
+            {"track_id": track_id},
+        ).mappings().first()
+
+        if not exists:
+            raise HTTPException(status_code=404, detail="Track no encontrado")
+
+        fields = []
+        params = {"track_id": track_id}
+
+        if "name" in payload:
+            fields.append("Name = :name")
+            params["name"] = (payload.get("name") or "").strip()
+
+        if "unit_price" in payload:
+            fields.append("UnitPrice = :unit_price")
+            params["unit_price"] = float(payload.get("unit_price"))
+
+        if "genre_id" in payload:
+            fields.append("GenreId = :genre_id")
+            genre_id = payload.get("genre_id")
+            params["genre_id"] = int(genre_id) if genre_id not in (None, "", 0, "0") else None
+
+        if "album_id" in payload:
+            fields.append("AlbumId = :album_id")
+            params["album_id"] = int(payload.get("album_id"))
+
+        if "media_type_id" in payload:
+            fields.append("MediaTypeId = :media_type_id")
+            params["media_type_id"] = int(payload.get("media_type_id"))
+
+        if not fields:
+            return {"ok": True, "updated": False}
+
+        sql = f"UPDATE Track SET {', '.join(fields)} WHERE TrackId = :track_id"
+        db.execute(text(sql), params)
+        db.commit()
+
+        return {"ok": True, "updated": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error actualizando track: {str(e)}")
+
+
+@router.delete("/{track_id}")
+def delete_track(
+    track_id: int,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    try:
+        # Borra referencias para no romper FK
+        db.execute(
+            text("DELETE FROM InvoiceLine WHERE TrackId = :track_id"),
+            {"track_id": track_id},
+        )
+        db.execute(
+            text("DELETE FROM PlaylistTrack WHERE TrackId = :track_id"),
+            {"track_id": track_id},
+        )
+
+        result = db.execute(
+            text("DELETE FROM Track WHERE TrackId = :track_id"),
+            {"track_id": track_id},
+        )
+
+        if result.rowcount == 0:
+            db.rollback()
+            raise HTTPException(status_code=404, detail="Track no encontrado")
+
+        db.commit()
+        return {"ok": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error eliminando track: {str(e)}")
