@@ -13,7 +13,7 @@ def require_admin(user=Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Solo admin")
     return user
 
-'''
+
 def parse_non_negative_price(raw_price):
     if raw_price is None or str(raw_price).strip() == "":
         raise HTTPException(status_code=400, detail="unit_price required")
@@ -27,7 +27,7 @@ def parse_non_negative_price(raw_price):
         raise HTTPException(status_code=400, detail="El precio no puede ser negativo")
 
     return price
-'''
+
 
 def get_or_create_album_for_artist(db: Session, artist_id: int) -> int:
     row = db.execute(
